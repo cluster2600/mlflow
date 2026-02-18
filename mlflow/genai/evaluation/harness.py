@@ -153,18 +153,19 @@ def _make_rate_limiter(
     return RPSRateLimiter(rps, adaptive=adaptive, max_rps_multiplier=max_rps_multiplier)
 
 
-def _pool_size(rps: float | None) -> int:
+def _pool_size(rps: float | None, max_rps_multiplier: float = 1.0) -> int:
     """Derive thread count from rate limit, capped at [10, 500].
 
-    Assumes each LLM call takes about ``_AVG_LLM_LATENCY_SECS`` seconds on
-    average, so we need ``rps * latency`` threads to keep the pipeline busy.
-    The rate limiter handles queueing — threads that can't get a token just
-    block in acquire(). The HTTP connection pool is auto-sized to match.
+    Assumes each LLM call takes about ``avg_llm_latency_secs`` seconds on
+    average, so we need ``peak_rps * latency`` threads to keep the pipeline
+    busy at the AIMD ceiling. The rate limiter handles queueing — threads
+    that can't get a token just block in acquire().
     """
     avg_llm_latency_secs = 2
     if not rps:
         return 10
-    return min(500, max(10, int(rps * avg_llm_latency_secs)))
+    peak_rps = rps * max_rps_multiplier
+    return min(500, max(10, int(peak_rps * avg_llm_latency_secs)))
 
 
 def backpressure_buffer(score_workers: int) -> int:
@@ -192,6 +193,7 @@ def _get_scorer_rate_config(
 def _get_pool_sizes(
     predict_rps: float | None,
     scorer_rps: float | None,
+    max_rps_multiplier: float = 1.0,
 ) -> tuple[int, int]:
     """Determine predict and score thread pool sizes.
 
@@ -201,7 +203,10 @@ def _get_pool_sizes(
     if MLFLOW_GENAI_EVAL_MAX_WORKERS.is_set():
         size = MLFLOW_GENAI_EVAL_MAX_WORKERS.get()
         return size, size
-    return _pool_size(predict_rps), _pool_size(scorer_rps)
+    return (
+        _pool_size(predict_rps, max_rps_multiplier),
+        _pool_size(scorer_rps, max_rps_multiplier),
+    )
 
 
 class _Heartbeat:
@@ -535,7 +540,8 @@ def _run_pipeline(
     )
     upper_multiplier = MLFLOW_GENAI_EVAL_RATE_LIMIT_UPPER_MULTIPLIER.get()
     max_retries = MLFLOW_GENAI_EVAL_MAX_RETRIES.get()
-    predict_workers, score_workers = _get_pool_sizes(predict_rps, scorer_rps)
+    pool_multiplier = upper_multiplier if predict_adaptive else 1.0
+    predict_workers, score_workers = _get_pool_sizes(predict_rps, scorer_rps, pool_multiplier)
 
     predictor = _PredictSubmitter(
         eval_items,
